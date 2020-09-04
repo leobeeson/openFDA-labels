@@ -62,6 +62,7 @@ library(mongolite)
 library(quanteda)
 library(tictoc)
 library(lubridate)
+library(knitr)
 ```
 <br/><br/>
 
@@ -373,9 +374,10 @@ mwe_obj <- estimate_mwe(tokens_obj, min_length = 2, max_length = 3, min_count = 
 <br/><br/>
 
 #### Explore top collocations for AZ:
-```{r}
+```{r, results='asis'}
 mwe_obj %>% 
-  head(30)
+  head(30) %>% 
+  knitr::kable(caption = "Top AZ Ingredients Collocations")
 ```
 We can observe many collocations reflecting quantities of weight, and others starting with a unit of measure of weight, which are particularly useful for our current tasks of identifying unique ingredients. Hence I decided to remove them with a few simple heuristics, as shown below.
 <br/><br/>
@@ -390,9 +392,10 @@ mwe_az <- mwe_obj %>%
 <br/><br/>
 
 Explore once again the now curated top collocations for AZ, having removed some noisy patterns:
-```{r}
+```{r, results='asis'}
 mwe_az %>% 
-  head(30)
+  head(30) %>% 
+  knitr::kable(caption = "Top Curated AZ Ingredients Collocations")
 ```
 <br/><br/>
 
@@ -413,10 +416,11 @@ corpus_df <- coll_all$find(query = '{}',
 <br/><br/>
 
 #### Explore corpus of medication documents from all manufacturers:
-```{r}
+```{r, results='asis'}
 corpus_df %>% 
+  select(brand_name, active_ingredient, inactive_ingredient) %>% 
   head() %>% 
-  as_tibble()
+  knitr::kable(caption = "Sample of Active and Inactive Ingredients Docs")
 
 ```
 We can see that the phrases "active ingredient" and "inactive ingredient" are highly recurrent, which can add significant noise to our collocations model, as they can be estimated as being part of a collocation with a preceding or succeeding work token/s, given the size of our corpus of >171k documents. Let's remove them from our text fields to reduce the vocabulary size and hence computation complexity.
@@ -500,7 +504,8 @@ mwe_obj <- estimate_mwe(tokens_obj, min_length = 2, max_length = 3, min_count = 
 #### Explore top collocations for all manufacturers:
 ```{r}
 mwe_obj %>% 
-  head(50)
+  head(50) %>% 
+  knitr::kable(caption = "Top Ingredients Collocations for All Manufacturers")
 ```
 <br/><br/>
 
@@ -516,7 +521,8 @@ mwe_all <- mwe_obj %>%
 #### Explore once again the curated top collocations for all manufacturers:
 ```{r}
 mwe_all %>% 
-  head(50)
+  head(50) %>% 
+  knitr::kable(caption = "Top Curated Ingredients Collocations for All Manufacturers")
 
 ```
 <br/><br/>
@@ -688,27 +694,27 @@ task_a_results <- corpus_df %>%
 <br/><br/>
 
 #### Visualize results:
-```{r}
+```{r out.width = "100%"}
 ggplot(task_a_results, mapping = aes(x = year, y = avg_number_of_ingredients, label = drug_names)) +
   geom_bar(stat = "Identity") +
-  geom_label() +
+  geom_label(size=1.5) +
   xlab("Year") +
   ylab("Mean # of Ingredients") +
   ggtitle("Ingredients in AstraZeneca Medications")
 ```
 
 #### Insights:
-From these results we can glean the following insights:
-* The openFDA only has AZ medication data in its label dataset dated from 2016 onward. Considering that AZ was founded 21 years ago, either the field `effective_time` does not represent the actual year a medication was either approved or launched to market, or the openFDA dataset suffers is missing significant gaps in data.
-* Supporting the above point, the medications Nexium and Esomeprazole Magnesium have for `effective_time` 2018. I know for a fact that Nexium has been around for more than 10 years as it was prescribed to me, and a little research indicates that Esomeprazole was launched back in 2001.
-* 2018 represents the year with the largest average number of ingredients in AZ's medications, driven by the oral forms of Nexium and Esomeprazole, at 25 ingredients.
-* 2019 represents the year with the smallest average number if ingredients, driven by a group of intravenous and inhalation type of medications.
+* From these results we can glean the following insights:
+  + The openFDA only has AZ medication data in its label dataset dated from 2016 onward. Considering that AZ was founded 21 years ago, either the field `effective_time` does not represent the actual year a medication was either approved or launched to market, or the openFDA dataset suffers is missing significant gaps in data.
+  + Supporting the above point, the medications Nexium and Esomeprazole Magnesium have for `effective_time` 2018. I know for a fact that Nexium has been around for more than 10 years as it was prescribed to me, and a little research indicates that Esomeprazole was launched back in 2001.
+  + 2018 represents the year with the largest average number of ingredients in AZ's medications, driven by the oral forms of Nexium and Esomeprazole, at 25 ingredients.
+  + 2019 represents the year with the smallest average number if ingredients, driven by a group of intravenous and inhalation type of medications.
 <br/><br/>
 
 ### 6. Unique Ingredients Extraction for All Manufacturers' Medications
 
 Now I retrieve all documents from MongoDB, including the "spl_product_data_elements" field for extracting and quantifying average ingredients per medication across all manufacturers per route of administration:
-```{r}
+```{r }
 corpus_df <- coll_all$find(query = '{}', 
                            fields = '{"set_id":true, 
                                       "effective_time":true,
@@ -724,7 +730,7 @@ corpus_df <- coll_all$find(query = '{}',
 
 #### Pre-process corpus, add year feature, and filter for recent medicines:
 In addition to the considerations mentioned above with regards to the `effective_time` field, for the all-manufacturer corpus I also filter out all documents before 2009, as there is a long left tail in the number of medications with `effective_time` before this year. Finally, there were many medications which had the field `route` blank, hence I replaced these blank fields the the categorical value "NOT SPECIFIED".
-```{r}
+```{r }
 corpus_df %<>%
   mutate(date_nchar = nchar(effective_time)) %>%      # Count number of chars in "effective_date" column
   filter(date_nchar == 8) %>%                         # Check that "effective_date" values have 8 char length character format
@@ -738,18 +744,18 @@ corpus_df %<>%
 <br/><br/>
 
 #### Create Quanteda corpus object for all manufacturer's medications:
-```{r}
+```{r }
 corpus_obj <- corpus(x = corpus_df, text_field = "spl_product_data_elements", docid_field = "set_id")
 ```
 
 #### Tokenize the Quanteda corpus object  for all manufacturer's medications:
-```{r}
+```{r }
 tokens_obj <- tokenize_corpus(corpus_obj)
 ```
 <br/><br/>
 
 #### Once again, explore a documents tokenization result, and compare to the compounded documents below:
-```{r}
+```{r }
 sample_doc <- sample(ndoc(tokens_obj), 1)
 tokens_obj[[sample_doc]]
 
@@ -757,7 +763,7 @@ tokens_obj[[sample_doc]]
 <br/><br/>
 
 #### Compound collocations in `spl_product_data_elements` to create multi-word tokens, using Quanteda's `tokens_compund` function:
-```{r}
+```{r }
 tic("Compound all manufacturers ingredients tokens")
 tokens_compounded <- tokens_compound(tokens_obj,
                                      pattern = phrase(mwe_obj),
@@ -768,7 +774,7 @@ toc()
 <br/><br/>
 
 #### Now compare the same tokenised document from above to itself with its collocations compounded:
-```{r}
+```{r }
 tokens_compounded[[sample_doc]]
 ```
 <br/><br/>
@@ -801,7 +807,7 @@ identify_unique_ingredients_all_manufacturers <- function(compounded_doc, ingred
 <br/><br/>
 
 #### Extract unique ingredients per medicine across all manufacturers:
-```{r}
+```{r }
 tic("Unique ingredients list all manufacturers")
 unique_ingredients_list <- vector("list", length = nrow(corpus_df))
 for (i in 1:nrow(corpus_df)) {
@@ -814,7 +820,7 @@ toc()
 <br/><br/>
 
 #### Add unique ingredients list to corpus dataframe:
-```{r}
+```{r }
 tic()
 corpus_df$unique_ingredients <- unique_ingredients_list %>% 
   lapply(., function(x) paste0(x, collapse = ", ")) %>% 
@@ -824,7 +830,7 @@ toc()
 <br/><br/>
 
 #### Calculate the number of unique ingredients per medicine:
-```{r}
+```{r }
 tic()
 corpus_df$unique_ingredients_count <- unique_ingredients_list %>% 
   lapply(., function(x) length(x)) %>% 
@@ -834,7 +840,7 @@ toc()
 <br/><br/>
 
 ### Calculate the average number of ingredients of AZ medicines per year:
-```{r}
+```{r }
 task_b_results <- corpus_df %>% 
   group_by(year, route) %>% 
   summarise(avg_number_of_ingredients = mean(unique_ingredients_count) %>% 
@@ -844,14 +850,14 @@ task_b_results <- corpus_df %>%
 
 #### Visualize results:
 Filtering for results between 2015 and 2020, and keeping only route categories with one route of administration, as many medications were classified as having several routes of administration.
-```{r}
+```{r, out.width = "100%"}
 ggplot(task_b_results %>% 
          filter(year > 2014, year <= 2020) %>% 
          filter(route != "NOT SPECIFIED") %>% 
          mutate(num_routes = str_count(string = route, pattern = ",") + 1) %>% 
          filter(num_routes == 1), mapping = aes(x = year, y = avg_number_of_ingredients, label = route)) +
   geom_point() +
-  geom_label() +
+  geom_label(size=1.5) +
   xlab("Year") +
   ylab("Mean # of Ingredients") +
   ggtitle("Ingredients in All Manufacturers Medications")
@@ -859,12 +865,12 @@ ggplot(task_b_results %>%
 <br/><br/>
 
 #### Insights:
-From these results we can glean the following insights:
-* Across the last five years, medications with the highest average number of ingredients are medications applied to the skin (e.g. topical, cutaneous, etc.) at around 20 ingredients on average per medication.
-* Following closely are the medications applied through the mouth and mucous membranes (e.g. oral, buccal, dental, transmucosal, nasal, etc.) at around 15 ingredients on average per medication.
-* At around 10 ingredients on average per medication, we see medications applied via vaginal and rectal routes (e.g. rectal, intrarectal, irrigation, vaginal, etc.)
-* At the lower end of the spectrum, below 5 ingredients on average per medication, we find inhalation, intravenous, and urethral routes of administration, indicating that those medications which can more freely enter the bloodstream tend to be delivered with as few ingredients as possible beyond the necessary active ingredients.
-* Answering one of the optional questions for this work, I would recommend heavily relying on the field `route` as an important feature for a model predicting the average number of ingredients next year.
+* From these results we can glean the following insights:
+  + Across the last five years, medications with the highest average number of ingredients are medications applied to the skin (e.g. topical, cutaneous, etc.) at around 20 ingredients on average per medication.
+  + Following closely are the medications applied through the mouth and mucous membranes (e.g. oral, buccal, dental, transmucosal, nasal, etc.) at around 15 ingredients on average per medication.
+  + At around 10 ingredients on average per medication, we see medications applied via vaginal and rectal routes (e.g. rectal, intrarectal, irrigation, vaginal, etc.).
+  + At the lower end of the spectrum, below 5 ingredients on average per medication, we find inhalation, intravenous, and urethral routes of administration, indicating that those medications which can more freely enter the bloodstream tend to be delivered with as few ingredients as possible beyond the necessary active ingredients.
+  + Answering one of the optional questions for this work, I would recommend heavily relying on the field `route` as an important feature for a model predicting the average number of ingredients next year.
 <br/><br/>
 
 ## Final Notes
