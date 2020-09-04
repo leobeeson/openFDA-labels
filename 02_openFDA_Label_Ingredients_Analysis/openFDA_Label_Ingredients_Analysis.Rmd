@@ -1,0 +1,887 @@
+---
+title: "Analysis of Ingredients in openFDA Drug Label Dataset"
+author: "Francis Beeson"
+date: "03/09/2020"
+output: html_document
+---
+<br/><br/>
+
+### Objectives
+* Using the data from the OpenFDA API:
+  + Determine the average number of ingredients contained in AstraZeneca's (AZ) medicines per year.
+  + Determine the average number of ingredients across all manufacturers per year per route of administration.
+  + Use the field `spl_product_data_elements` for identifying a medicine's ingredients.
+<br/><br/>
+
+### Problems
+* The field `spl_product_data_elements` does not contain punctuations, difficulting the task of identifying the boundaries of multi-word ingredient.
+* Given the morphology of the pharmaceutical linguistic domain, we can asssume that a significant portion of medications' ingredients are multi-worded, i.e. n-grams.
+* Traditional brute-force n-graming approaches, aswell as pharmaceutical named entity extraction, can be resource intensive and expensive.
+<br/><br/>
+
+### Solution Proposal
+1. Estimate ingredient-specific collocations (a.k.a Multi-word expressions [MWE]), leveraging the dataset's fields which contain properly punctuated lists of ingredients.
+2. Use the learned ingredient-specific collocations to compound the unbounded multi-word ingredients in the `spl_product_data_elements` field.
+3. Count the unique list of compounded multi-word ingredients plus single-word ingredients per AZ's medicines.
+4. Count the unique list of compounded multi-word ingredients plus single-word ingredients for all manufacturers per year per route of administration.
+<br/><br/>
+
+### Previous Iteration:
+* On a previous iteration, the openFDA API was used to explore AZ's data in the openFDA Drug Label dataset. The following observations are carried forward to this iteration:
+  + There were 41 medicine labels from AstraZeneca returned from the openFDA drug label dataset, identified with manufacturer_name == "AstraZeneca Pharmaceuticals LP" in the openfda object in the response objects.
+  + API queries looking for results of partial matches to the search terms "astra" or "zeneca" mostly returned objects with an empty openfda object, hence the manufacturer_name field was missing, not allowing to conclusive identify the medicine as belonging to AZ. An example of this returned objects contained the following substring in the field "how_supplied": "All trademarks are the property of the AstraZeneca group©AstraZeneca 2002AstraZeneca LP, Wilmington, DE 19850721668-04 Rev. 05/04" (product == POLOCAINE).
+  + The fields for "active_ingredient" and "inactive_ingredient" in AZ medicines labels are empty (i.e contain no data).
+  + However, a verbose account of AZ medication's active and inactive ingredients can be founded within the block of text inside the "description" field.
+* This previous iteration can be found in the jupyter notebook at 01_openFDA_API_Exploration/QueryOpenFDA-API.ipynb alongside this project.
+<br/><br/>
+
+### Methodology for the Current Iteration:
+1. Download all of the openFDA Drug Label Dataset
+2. Extract, transform, and load into MongoDB
+3. Learn AZ-specific ingredient key phrases, by leveraging AZ's label descriptions which contain active and inactive ingredients, separated by columns. Here I use a low threshold for estimating collocations, allowing for more AZ-specific multi-word terms to be extracted.
+4. Learn key phrases for pharmaceutical ingredients, leveraging the full corpus' `active_ingredient` and `inactive_ingredient fields`. Here I set a high threshold for estimating collocations, to learn only general multi-word ingredients in the pharmaceutical domain.
+5. Extract the unique ingredients for AZ's medicines, and calculate the average number of ingredients per year.
+6. Extract the unique ingredients for all manufacturers medicines, and calculate the average number of ingredients per year per route of administration.
+<br/><br/>
+
+### Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+1. [Install MongoDB](https://docs.mongodb.com/manual/installation/) for your operating system, if you haven't already done it. 
+<br/><br/>
+
+#### Import libraries
+```{r message=FALSE}
+library(downloader)
+library(jsonlite)
+library(tidyverse)
+library(mongolite)
+library(quanteda)
+library(tictoc)
+library(lubridate)
+```
+<br/><br/>
+
+#### Set parallelisation parameters for Quanteda threading
+```{r}
+quanteda_options(threads = (RcppParallel::defaultNumThreads() - 1))
+cat(paste0("Quanteda using ", quanteda_options("threads"), " parallel processing threads.\nLeaving 1 available for your other stuff..."))
+```
+<br/><br/>
+
+### 1. Download Data
+
+#### Download and unzip openFDA drug label datasets:
+```{r eval=FALSE}
+for (f in 1:9) {
+  url = paste0("https://download.open.fda.gov/drug/label/drug-label-000", f ,"-of-0009.json.zip")
+  download(url, dest = "json.zip")
+  unzip("json.zip", exdir = "datasets_json")
+}
+```
+<br/><br/>
+
+#### Housecleaning:
+```{r eval=FALSE}
+file.remove("json.zip")
+```
+<br/><br/>
+
+### MongoDB Setup
+<br/><br/>
+
+#### Create Mongo Client and initiallise collection for all-manufacturer's dataset:
+```{r}
+coll_all <- mongo(collection = "all_manufacturers", db = "openFDA", url = "mongodb://127.0.0.1:27017/")
+```
+<br/><br/>
+
+### 2. Extract, Transform, Load
+
+#### Function for converting list columns to vector and clean NULL and NA:
+```{r}
+transform_list_column <- function(list_field) {
+  temp <- sapply(list_field, function (x) paste0(x, collapse = ", "))
+  temp <- na_if(temp, "NULL")
+  temp <- replace_na(temp, "")
+}
+```
+<br/><br/>
+
+#### Function for transforming a json file from openFDA to a dataframe with the variables of interest:
+```{r}
+transform_results_object_to_df <- function(data_object, 
+                                           outer_vector_columns, 
+                                           outer_list_columns, 
+                                           outer_df_column, 
+                                           inner_df_list_columns) {
+  outer_all_columns <- c(outer_vector_columns, outer_list_columns)  
+  outer_df <- data_object[ , outer_all_columns] %>% 
+    mutate_at(outer_list_columns, transform_list_column)
+  
+  inner_df <- data_object %>% 
+    pull(all_of(outer_df_column)) %>% 
+    select(all_of(inner_df_list_columns)) %>% 
+    mutate_at(inner_df_list_columns, transform_list_column)
+  
+  data_df <- bind_cols(inner_df, outer_df) %>% 
+    relocate(set_id, effective_time, brand_name, generic_name, substance_name)
+}
+```
+<br/><br/>
+
+#### Parameters for selecting variables of interest from openFDA drug label dataset:
+```{r}
+outer_vector_columns <- c("set_id", 
+                          "effective_time")
+
+outer_list_columns <- c("active_ingredient", 
+                        "inactive_ingredient", 
+                        "spl_product_data_elements", 
+                        "description", "purpose", 
+                        "drug_interactions")
+
+outer_df_column <- "openfda"
+
+inner_df_list_columns <- c("manufacturer_name", 
+                           "generic_name", 
+                           "brand_name", 
+                           "substance_name", 
+                           "route", 
+                           "product_type")
+
+```
+<br/><br/>
+
+#### Define path to dataset json files:
+```{r}
+path_to_datasets_json <- "datasets_json/"
+datasets_json <- list.files(path_to_datasets_json)
+```
+<br/><br/>
+
+#### Execute ETL:
+```{r eval=FALSE}
+tic("ETL Full Process")
+for (i in 1:length(datasets_json)) {
+  tic(paste0("ETL part ", i))
+  dataset_temp <- fromJSON(paste0(path_to_datasets_json, datasets_json[i]))$results    # Extract
+  dataset_temp <- transform_results_object_to_df(dataset_temp,                         # Transform
+                                                 outer_vector_columns, 
+                                                 outer_list_columns, 
+                                                 outer_df_column, 
+                                                 inner_df_list_columns)
+  print(paste0("Estimated memory size dataset part ", i, ": ", format(object.size(dataset_temp), units = "Mb")))
+  coll_all$insert(dataset_temp)                                                        # Load
+  toc()
+}
+```
+<br/><br/>
+
+#### Housecleaning:
+```{r}
+rm(list=base::setdiff(ls(), c("coll_all")))
+```
+<br/><br/>
+
+## Feature Extraction
+
+#### Stopwords:
+<br/><br/>
+
+##### Define stopwords:
+```{r}
+stopwords <- c(stopwords("english"))
+
+```
+<br/><br/>
+
+Stopwords you want to remove from the default stopwords list:
+```{r}
+sw_to_exclude <- c("no", "not", "un", "eu", "são")
+if (exists("sw_to_exclude")) {
+  stopwords <- setdiff(stopwords, sw_to_exclude)
+}
+
+```
+<br/><br/>
+
+Words you don't want leading or trailing a MWE, but which are acceptable inside the MWE:
+```{r}
+sw_to_include <- c()
+if (exists("sw_to_include")) {
+  stopwords <- c(stopwords, sw_to_include)
+}
+
+```
+<br/><br/>
+
+#### Tokenization and collocation extraction functions:
+```{r}
+tokenize_corpus <- function(corpus_obj) {
+  # Description:
+  # - Function for tokenizing a quanteda corpus object:
+  # Params:
+  # - corpus_obj: a Quanteda corpus object
+  # Returns:
+  # - tokens_obj: a Quanteda tokens object
+  
+  tic("Tokenize corpus")
+  # Tokenize without removing any characters, and convert to lowercase:
+  tokens_obj <- tokens_tolower(tokens(x = corpus_obj,
+                                      split_hyphens = FALSE,
+                                      remove_punct = FALSE,
+                                      remove_numbers = FALSE,
+                                      remove_symbols = FALSE))
+  
+  # Filter tokens for only those used for natural language (in latin script plus diacritics, ligatures, etc.):
+  tokens_obj <- tokens_select(tokens_obj,
+                              pattern = "^[A-Za-zšœÀ-ÖØ-öø-ÿ0-9&_\\(\\)-]+$",
+                              valuetype = "regex",
+                              selection = "keep",
+                              padding = TRUE)
+  
+  
+  # remove tokens consisting of only 1 letter:
+  tokens_obj <- tokens_select(tokens_obj,
+                              pattern = "(\\w{2,})",
+                              valuetype = "regex",
+                              selection = "keep",
+                              padding = TRUE)
+  
+  # Print # of unique tokens:
+  tokens_obj %>% 
+    types() %>% 
+    length() %>% 
+    paste0("Number of unique tokens: ", .) %>% 
+    print()
+    
+  toc()
+  return(tokens_obj)
+}
+```
+<br/><br/>
+
+```{r}
+estimate_mwe <- function(tokens_obj, min_length, max_length, min_count) {
+  # Description:
+  # - Function for estimating collocations (Multi-word Expressions, MWE)
+  # Params:
+  # - tokens_obj: a Quanteda tokens object
+  # - min_length: minimum n-gram size
+  # - max_length: maximum n-gram size
+  # - min_count: minimum number of occurrences of a term in the corpus
+  # Returns:
+  # - mwe_obj: a Quanteda collocations object, with collocations, frequency counts, nested counts, and PMI statistics.
+  
+  tic("Estimate collocations")
+  
+  # Estimate collocations using Quanteda library:
+  mwe_obj <- textstat_collocations(x = tokens_obj, size = min_length:max_length, min_count = min_count)
+  
+  # Function for vectorization of stopword matching:
+  match_sw <- function(x, stopwords){
+    x %in% stopwords
+  }
+  
+  # Flag leading stopwords
+  mwe_obj$leading_sw <- sapply(X = word(string = mwe_obj$collocation, start = 1L), FUN = match_sw, stopwords)
+  
+  # Flag trailing stopwords
+  mwe_obj$trailing_sw <- sapply(X = word(string = mwe_obj$collocation, start = -1L),FUN = match_sw, stopwords)
+  
+  # Remove leading and trailing stopwords
+  mwe_obj <- mwe_obj %>%
+    filter(leading_sw == FALSE & trailing_sw == FALSE)
+  
+  # Remove dummy columns:
+  mwe_obj$leading_sw <- NULL
+  mwe_obj$trailing_sw <- NULL
+  
+  # Print number of extracted collocations after filtering:
+  mwe_obj$collocation %>%
+    length() %>%
+    paste0("Number of collocations remaining: ",.) %>%
+    print()
+  
+  toc()
+  return(mwe_obj)
+}
+```
+<br/><br/>
+
+### 3. Extract AZ-Specific Ingredients Collocations
+
+Retrieve AZ documents from MongoDB, selecting only the fields conducive for learning AZ ingredient-specific collocations:
+```{r}
+corpus_df <- coll_all$find(query = '{"manufacturer_name" : "AstraZeneca Pharmaceuticals LP"}', 
+                           fields = '{"set_id":true, 
+                                    "manufacturer_name":true,
+                                    "brand_name":true,
+                                    "generic_name":true,
+                                    "substance_name":true,
+                                    "active_ingredient":true, 
+                                    "inactive_ingredient":true,
+                                    "description":true,
+                                    "_id":false}',
+                           limit = 1000)
+```
+<br/><br/>
+
+Concatenate all relevant fields into a single string to pass as documents to Quanteda's collocation extraction function. I include the "description" field as it contains AZ's description of active and inactive ingredients:
+```{r}
+corpus_df <- corpus_df %>% 
+  unite("text", c(brand_name, 
+                  generic_name, 
+                  substance_name,
+                  active_ingredient,
+                  inactive_ingredient,
+                  description), remove = FALSE, na.rm = TRUE, sep = ", ") %>% 
+  select(set_id, manufacturer_name, brand_name, text) 
+```
+<br/><br/>
+
+#### Create Quanteda corpus object for AZ's medications:
+I pass the concatenated fields to the `text_field` parameter which expects text documents as arguments, and the `set_id` argument to the `docid_field` parameter which expects unique identifiers for every document. In this case, every document corresponds to a medication.
+```{r}
+corpus_obj <- corpus(x = corpus_df, text_field = "text", docid_field = "set_id")
+
+```
+<br/><br/>
+
+#### Tokenize the Quanteda corpus object  for AZ's medications:
+```{r}
+tokens_obj <- tokenize_corpus(corpus_obj)
+```
+<br/><br/>
+
+#### Explore a documents tokenization result:
+```{r}
+tokens_obj[[sample(ndoc(tokens_obj), 1)]]
+
+```
+<br/><br/>
+
+#### Estimate collocations for AZ's medications:
+```{r}
+mwe_obj <- estimate_mwe(tokens_obj, min_length = 2, max_length = 3, min_count = 3)
+
+```
+<br/><br/>
+
+#### Explore top collocations for AZ:
+```{r}
+mwe_obj %>% 
+  head(30)
+```
+We can observe many collocations reflecting quantities of weight, and others starting with a unit of measure of weight, which are particularly useful for our current tasks of identifying unique ingredients. Hence I decided to remove them with a few simple heuristics, as shown below.
+<br/><br/>
+
+#### Ad-hoc post-processing of collocations:
+```{r}
+mwe_az <- mwe_obj %>%
+  filter(! grepl(pattern = "^([0-9]|mg|mcg).*$", .$collocation)) %>% 
+  filter(! grepl(pattern = "\\btablet(s)*\\b|\\bdose(s)*\\b|\\bfilm\\b|\\bfollowing\\b", .$collocation))
+
+```
+<br/><br/>
+
+Explore once again the now curated top collocations for AZ, having removed some noisy patterns:
+```{r}
+mwe_az %>% 
+  head(30)
+```
+<br/><br/>
+
+### 4. Extract All-Manufacturer Collocations:
+
+#### Retrieve all documents from MongoDB:
+```{r}
+corpus_df <- coll_all$find(query = '{}', 
+                           fields = '{"set_id":true, 
+                                     "manufacturer_name":true,
+                                     "brand_name":true,
+                                     "generic_name":true,
+                                     "substance_name":true,
+                                     "active_ingredient":true, 
+                                     "inactive_ingredient":true,
+                                     "_id":false}')
+```
+<br/><br/>
+
+#### Explore corpus of medication documents from all manufacturers:
+```{r}
+corpus_df %>% 
+  head() %>% 
+  as_tibble()
+
+```
+We can see that the phrases "active ingredient" and "inactive ingredient" are highly recurrent, which can add significant noise to our collocations model, as they can be estimated as being part of a collocation with a preceding or succeeding work token/s, given the size of our corpus of >171k documents. Let's remove them from our text fields to reduce the vocabulary size and hence computation complexity.
+<br/><br/>
+
+Remove recurrent phrases "active ingredient" and "inactive ingredient" to reduce noise. The following regex can be refactored for improved efficiency, but will have to do in the meantime given the work's time constraint.
+```{r}
+active_ingredient_pattern = c("ingredient( active)*|active i\\s*nd*gre+di*e+nt(s|s:|:)*|active ingrediet|active in*gredien\\s*t|active ingrede*int|active lngredient|active ingredien|active ingredinet|active ingreditents*")
+
+inactive_ingredient_pattern = c("ingredient( inactive)*|inactive i\\s*nd*gre+di*e+nt(s|s:|:)*|inactive ingrediet|inactive in*gredien\\s*t|inactive ingrede*int|inactive lngredient|inactive ingredien|inactive ingredinet|inactive ingreditents*")
+
+tic("Pre-process all manufacturers corpus")
+corpus_df <- corpus_df %>% 
+  mutate(active_ingredient = gsub(pattern = active_ingredient_pattern, 
+                                  replacement = "", 
+                                  x = .$active_ingredient, 
+                                  ignore.case = TRUE)) %>% 
+  mutate(inactive_ingredient = gsub(pattern = inactive_ingredient_pattern, 
+                                    replacement = "", 
+                                    x = .$inactive_ingredient, 
+                                    ignore.case = TRUE))
+toc()
+
+```
+<br/><br/>
+
+#### How many medications include data for the `active_ingredient` and `inactive_ingredient` fields:
+```{r}
+corpus_df %>% 
+  mutate(nchar_act_ing = nchar(active_ingredient)) %>% 
+  mutate(act_ing_flag = ifelse(nchar_act_ing == 0, FALSE, TRUE)) %>% 
+  select(act_ing_flag) %>% 
+  pull() %>% 
+  table() %>% 
+  prop.table() * 100
+```
+<br/><br/>
+
+#### Concatenate all relevant fields into a single string. 
+Given that the corpus has >171k documents, I removed the `description` field to reduce the vocabulary size, model complexity, and computation time for collocations estimates. However, the `description` field was particularly relevant for AZ's medications as they lacked data for the `active_ingredient` and `inactive_ingredient` fields, but included key punctuation-bounded ingredients descriptions. However, as shown in the cell above, 62% of all other medications did include the `active_ingredient` and `inactive_ingredient` fields, hence making the `description` field not necessary for learning collocations for the full corpus.  
+```{r}
+tic("Process all manufacturers corpus")
+corpus_df <- corpus_df %>% 
+  unite("text", c(brand_name, 
+                  generic_name, 
+                  substance_name,
+                  active_ingredient,
+                  inactive_ingredient
+  ), remove = FALSE, na.rm = TRUE, sep = ", ") %>% 
+  select(set_id, manufacturer_name, brand_name, text)
+toc()
+```
+<br/><br/>
+
+#### Create Quanteda corpus object for all manufacturers' medications:
+```{r}
+corpus_obj <- corpus(x = corpus_df, text_field = "text", docid_field = "set_id")
+```
+<br/><br/>
+
+#### Tokenize the Quanteda corpus object for all manufacturers's medications:
+```{r}
+tokens_obj <- tokenize_corpus(corpus_obj)
+```
+<br/><br/>
+
+#### Explore a documents tokenization result:
+```{r}
+tokens_obj[[sample(ndoc(tokens_obj), 1)]]
+
+```
+<br/><br/>
+
+#### Estimate collocations for all manufacturers' medications:
+```{r}
+mwe_obj <- estimate_mwe(tokens_obj, min_length = 2, max_length = 3, min_count = 3)
+
+```
+<br/><br/>
+
+#### Explore top collocations for all manufacturers:
+```{r}
+mwe_obj %>% 
+  head(50)
+```
+<br/><br/>
+
+#### Apply the same Ad-hoc post-processing as for AZ collocations:
+```{r}
+mwe_all <- mwe_obj %>%
+  filter(! grepl(pattern = "^([0-9]|mg|mcg).*$", .$collocation)) %>% 
+  filter(! grepl(pattern = "\\btablet(s)*\\b|\\bdose(s)*\\b|\\bfilm\\b|\\bfollowing\\b", .$collocation))
+
+```
+<br/><br/>
+
+#### Explore once again the curated top collocations for all manufacturers:
+```{r}
+mwe_all %>% 
+  head(50)
+
+```
+<br/><br/>
+
+#### Create a collocations set by joining the fine-grained AZ-specific collocations, and the general all-manufacturer collocations:
+I also remove any collocation which has the word "and" in between tow other words, as it would most likely refer to a collocation composed of two ingredients, and not a single multi-word ingredient.
+```{r}
+mwe_obj <- c(mwe_az$collocation, mwe_all$collocation) %>% 
+  unique() %>% 
+  .[!grepl(pattern = "^.+\\s{1}and\\s{1}.+$", x = .)]   # Remove "and" as the middle word in a trigram.
+```
+<br/><br/>
+
+### 5. Unique Ingredients Extraction for AZ's Medications
+
+I now retrieve AZ documents from MongoDB, including the `spl_product_data_elements` field for extracting and quantifying average ingredients per medication, by compounding the learned collocations on the unbounded multi-word ingredients in the `spl_product_data_elements` field. 
+I also pull from MongoDB the `brand_name`, `generic_name`, and `substance_name` fields to use them as stopwords when preprocessing the `spl_product_data_elements` field, as it most often includes the medication's brand, generic, and substance name, and we don't want to count them among the medication's ingredients.
+```{r}
+corpus_df <- coll_all$find(query = '{"manufacturer_name": "AstraZeneca Pharmaceuticals LP"}', 
+                           fields = '{"set_id":true, 
+                                      "effective_time":true,
+                                      "manufacturer_name":true,
+                                      "brand_name":true,
+                                      "generic_name":true,
+                                      "substance_name":true,
+                                      "spl_product_data_elements":true,
+                                      "_id":false}')
+
+```
+<br/><br/>
+
+#### Pre-process corpus and add year feature:
+In an exploratory first run of this task, I ran into an error when trying to convert the `effective_time` field into a date format, as a few medication observations contained more than the 8-character format (YYYYMMDD) which most other have. Although none of AZ's medications where among these problematic observations, I include the same code chunk as I'll use in section 6 (Unique Ingredients Extraction for All Manufacturers' Medications), in case in a future execution of this code, new medications from AZ have been added to openFDA's dataset which might present this problem. 
+```{r}
+corpus_df %<>%
+  mutate(date_nchar = nchar(effective_time)) %>%     # Count number of chars in "effective_date" column
+  filter(date_nchar == 8) %>%                        # Check that "effective_date" values have 8 char length
+  select(-date_nchar) %>% 
+  mutate(effective_time = ymd(effective_time)) %>%   # Convert "effective_date" column to date format
+  mutate(year = year(effective_time)) %>% 
+  relocate(set_id, year)
+```
+<br/><br/>
+
+#### Create Quanteda corpus object for AZ's medications:
+```{r}
+corpus_obj <- corpus(x = corpus_df, text_field = "spl_product_data_elements", docid_field = "set_id")
+```
+
+#### Tokenize the Quanteda corpus object  for AZ's medications:
+```{r}
+tokens_obj <- tokenize_corpus(corpus_obj)
+```
+<br/><br/>
+
+#### Once again, explore a documents tokenization result, and compare to the compounded documents below:
+```{r}
+sample_doc <- sample(ndoc(tokens_obj), 1)
+tokens_obj[[sample_doc]]
+
+```
+<br/><br/>
+
+#### Compound collocations in `spl_product_data_elements` to create multi-word tokens, using Quanteda's `tokens_compund` function:
+```{r}
+tic("Compound AZ ingredients tokens")
+tokens_compounded <- tokens_compound(tokens_obj,
+                                     pattern = phrase(mwe_obj),
+                                     join = TRUE)
+toc()
+
+```
+<br/><br/>
+
+#### Now compare the same tokenised document from above to itself with its collocations compounded:
+```{r}
+tokens_compounded[[sample_doc]]
+```
+<br/><br/>
+
+#### Function for identifying unique ingredients in a label's document: 
+```{r}
+identify_unique_ingredients <- function(compounded_doc, ingredient_stopwords, brand_name, generic_name, substance_name) {
+  # Description:
+  # - Funciton for identifying unique ingredients in a label's document.
+  # Params:
+  # - compounded_doc: a Quanteda tokens object, with compounded collocations
+  # - ingredient_stopwords: user-curated ingredient stopwords for noisy terms
+  # - brand_name: medicine's brand name
+  # - generic_name: edicine's generic name
+  # - substance_name: edicine's substance name
+  # Returns:
+  # - List of unique tokens
+  temp_bl <- c(ingredient_stopwords, brand_name, generic_name, substance_name) %>% 
+    unique() %>% 
+    tolower() %>% 
+    str_replace_all(" ", "_") %>% 
+    paste0(., collapse = "$|^") %>% 
+    paste0("^", ., "$", collapse = "")
+  
+  temp_toks <- compounded_doc %>% 
+    unique() %>%                               # Remove duplicated ingredients.
+    .[!grepl(pattern = "^[0-9]+$", x = .)] %>% # Remove any token composed only of digits.
+    .[nchar(.) > 3] %>%                        # Remove any tokens with 3 or less characters.
+    .[!grepl(pattern = temp_bl, x = .)]        # Remove ingredients stopwords.
+}
+```
+<br/><br/>
+
+#### Define list of user-curated stopwords for ingredient candidates:
+These were a few tokens which seemed to be recurrent and that don't represent an actual ingredient, hence we remove them from the list of unique ingredient candidates.
+```{r}
+ingredient_stopwords <- c("unspecified", "unspecified_form", "biconvex", "biconvenx", "wamw", "and", "pale", "light", "light_-*", "dark", "capsule", "round", "yellow", "blue", "red", "beige", "brown", "pink", "white", "black")
+
+```
+<br/><br/>
+
+#### Extract unique ingredients per medication:
+I now iterate over each AZ medication, and add each medication's brand, generic, and substance name to the ingredients stopwords, and extract the unique single-and-multi-word ingredients.
+```{r}
+tic("Unique ingredients ist")
+unique_ingredients_list <- vector("list", length = nrow(corpus_df))
+for (i in 1:nrow(corpus_df)) {
+  brand_name <- corpus_df$brand_name[i]
+  generic_name <- corpus_df$generic_name[i]
+  substance_name <- corpus_df$substance_name[i]
+  
+  temp_comp_toks <- tokens_compounded[[i]]
+  unique_ingredients <- identify_unique_ingredients(temp_comp_toks, 
+                                                    ingredient_stopwords, 
+                                                    brand_name, 
+                                                    generic_name, 
+                                                    substance_name)
+  unique_ingredients_list[[i]] <- unique_ingredients
+}
+toc()
+```
+<br/><br/>
+
+#### Add unique ingredients list to corpus dataframe:
+```{r}
+tic()
+corpus_df$unique_ingredients <- unique_ingredients_list %>% 
+  lapply(., function(x) paste0(x, collapse = ", ")) %>% 
+  unlist()
+toc()
+```
+<br/><br/>
+
+#### Calculate the number of unique ingredients per medicine:
+```{r}
+tic()
+corpus_df$unique_ingredients_count <- unique_ingredients_list %>% 
+  lapply(., function(x) length(x)) %>% 
+  unlist()
+toc()
+```
+<br/><br/>
+
+### Calculate the average number of ingredients of AZ medicines per year:
+```{r}
+task_a_results <- corpus_df %>% 
+  group_by(year) %>% 
+  summarise(drug_names = paste0(brand_name %>%
+                                  str_to_title(), collapse = ", "),
+            avg_number_of_ingredients = mean(unique_ingredients_count) %>% 
+              round(digits = 2))
+```
+<br/><br/>
+
+#### Visualize results:
+```{r}
+ggplot(task_a_results, mapping = aes(x = year, y = avg_number_of_ingredients, label = drug_names)) +
+  geom_bar(stat = "Identity") +
+  geom_label() +
+  xlab("Year") +
+  ylab("Mean # of Ingredients") +
+  ggtitle("Ingredients in AstraZeneca Medications")
+```
+
+#### Insights:
+From these results we can glean the following insights:
+* The openFDA only has AZ medication data in its label dataset dated from 2016 onward. Considering that AZ was founded 21 years ago, either the field `effective_time` does not represent the actual year a medication was either approved or launched to market, or the openFDA dataset suffers is missing significant gaps in data.
+* Supporting the above point, the medications Nexium and Esomeprazole Magnesium have for `effective_time` 2018. I know for a fact that Nexium has been around for more than 10 years as it was prescribed to me, and a little research indicates that Esomeprazole was launched back in 2001.
+* 2018 represents the year with the largest average number of ingredients in AZ's medications, driven by the oral forms of Nexium and Esomeprazole, at 25 ingredients.
+* 2019 represents the year with the smallest average number if ingredients, driven by a group of intravenous and inhalation type of medications.
+<br/><br/>
+
+### 6. Unique Ingredients Extraction for All Manufacturers' Medications
+
+Now I retrieve all documents from MongoDB, including the "spl_product_data_elements" field for extracting and quantifying average ingredients per medication across all manufacturers per route of administration:
+```{r}
+corpus_df <- coll_all$find(query = '{}', 
+                           fields = '{"set_id":true, 
+                                      "effective_time":true,
+                                      "manufacturer_name":true,
+                                      "brand_name":true,
+                                      "generic_name":true,
+                                      "substance_name":true,
+                                      "spl_product_data_elements":true,
+                                      "route":true,
+                                      "_id":false}')
+```
+<br/><br/>
+
+#### Pre-process corpus, add year feature, and filter for recent medicines:
+In addition to the considerations mentioned above with regards to the `effective_time` field, for the all-manufacturer corpus I also filter out all documents before 2009, as there is a long left tail in the number of medications with `effective_time` before this year. Finally, there were many medications which had the field `route` blank, hence I replaced these blank fields the the categorical value "NOT SPECIFIED".
+```{r}
+corpus_df %<>%
+  mutate(date_nchar = nchar(effective_time)) %>%      # Count number of chars in "effective_date" column
+  filter(date_nchar == 8) %>%                         # Check that "effective_date" values have 8 char length character format
+  select(-date_nchar) %>% 
+  mutate(effective_time = ymd(effective_time)) %>%    # Convert "effective_date" column to date format
+  mutate(year = year(effective_time)) %>%
+  filter(year >= 2009) %>%                            # Filter only for medications from 2009 onward
+  mutate(route = if_else(route == "", "NOT SPECIFIED", route)) %>%  # Replace blank values for "route" field
+  relocate(set_id, year)
+```
+<br/><br/>
+
+#### Create Quanteda corpus object for all manufacturer's medications:
+```{r}
+corpus_obj <- corpus(x = corpus_df, text_field = "spl_product_data_elements", docid_field = "set_id")
+```
+
+#### Tokenize the Quanteda corpus object  for all manufacturer's medications:
+```{r}
+tokens_obj <- tokenize_corpus(corpus_obj)
+```
+<br/><br/>
+
+#### Once again, explore a documents tokenization result, and compare to the compounded documents below:
+```{r}
+sample_doc <- sample(ndoc(tokens_obj), 1)
+tokens_obj[[sample_doc]]
+
+```
+<br/><br/>
+
+#### Compound collocations in `spl_product_data_elements` to create multi-word tokens, using Quanteda's `tokens_compund` function:
+```{r}
+tic("Compound all manufacturers ingredients tokens")
+tokens_compounded <- tokens_compound(tokens_obj,
+                                     pattern = phrase(mwe_obj),
+                                     join = TRUE)
+toc()
+
+```
+<br/><br/>
+
+#### Now compare the same tokenised document from above to itself with its collocations compounded:
+```{r}
+tokens_compounded[[sample_doc]]
+```
+<br/><br/>
+
+
+For all manufacturers I had to remove the brand, generic, and substance name, from the ingredients stopwords list, as it was significantly increasing the time to loop over the 171k documents. Hence I traded quality for increased performance:
+```{r}
+identify_unique_ingredients_all_manufacturers <- function(compounded_doc, ingredient_stopwords) {
+  # Description:
+  # - Funciton for identifying unique ingredients in a label's document.
+  # Params:
+  # - compounded_doc: a Quanteda tokens object, with compounded collocations
+  # - ingredient_stopwords: user-curated ingredient stopwords for noisy terms
+  # Returns:
+  # - List of unique tokens
+  temp_bl <- c(ingredient_stopwords) %>% 
+    unique() %>% 
+    tolower() %>% 
+    str_replace_all(" ", "_") %>% 
+    paste0(., collapse = "$|^") %>% 
+    paste0("^", ., "$", collapse = "")
+  
+  temp_toks <- compounded_doc %>% 
+    unique() %>% 
+    .[!grepl(pattern = "^[0-9]+$", x = .)] %>% 
+    .[nchar(.) > 3] %>% 
+    .[!grepl(pattern = temp_bl, x = .)]
+}
+```
+<br/><br/>
+
+#### Extract unique ingredients per medicine across all manufacturers:
+```{r}
+tic("Unique ingredients list all manufacturers")
+unique_ingredients_list <- vector("list", length = nrow(corpus_df))
+for (i in 1:nrow(corpus_df)) {
+  temp_comp_toks <- tokens_compounded[[i]]
+  unique_ingredients <- identify_unique_ingredients_all_manufacturers(temp_comp_toks, ingredient_stopwords)
+  unique_ingredients_list[[i]] <- unique_ingredients
+}
+toc()
+```
+<br/><br/>
+
+#### Add unique ingredients list to corpus dataframe:
+```{r}
+tic()
+corpus_df$unique_ingredients <- unique_ingredients_list %>% 
+  lapply(., function(x) paste0(x, collapse = ", ")) %>% 
+  unlist()
+toc()
+```
+<br/><br/>
+
+#### Calculate the number of unique ingredients per medicine:
+```{r}
+tic()
+corpus_df$unique_ingredients_count <- unique_ingredients_list %>% 
+  lapply(., function(x) length(x)) %>% 
+  unlist()
+toc() 
+```
+<br/><br/>
+
+### Calculate the average number of ingredients of AZ medicines per year:
+```{r}
+task_b_results <- corpus_df %>% 
+  group_by(year, route) %>% 
+  summarise(avg_number_of_ingredients = mean(unique_ingredients_count) %>% 
+              round(digits = 2))
+```
+<br/><br/>
+
+#### Visualize results:
+Filtering for results between 2015 and 2020, and keeping only route categories with one route of administration, as many medications were classified as having several routes of administration.
+```{r}
+ggplot(task_b_results %>% 
+         filter(year > 2014, year <= 2020) %>% 
+         filter(route != "NOT SPECIFIED") %>% 
+         mutate(num_routes = str_count(string = route, pattern = ",") + 1) %>% 
+         filter(num_routes == 1), mapping = aes(x = year, y = avg_number_of_ingredients, label = route)) +
+  geom_point() +
+  geom_label() +
+  xlab("Year") +
+  ylab("Mean # of Ingredients") +
+  ggtitle("Ingredients in All Manufacturers Medications")
+```
+<br/><br/>
+
+#### Insights:
+From these results we can glean the following insights:
+* Across the last five years, medications with the highest average number of ingredients are medications applied to the skin (e.g. topical, cutaneous, etc.) at around 20 ingredients on average per medication.
+* Following closely are the medications applied through the mouth and mucous membranes (e.g. oral, buccal, dental, transmucosal, nasal, etc.) at around 15 ingredients on average per medication.
+* At around 10 ingredients on average per medication, we see medications applied via vaginal and rectal routes (e.g. rectal, intrarectal, irrigation, vaginal, etc.)
+* At the lower end of the spectrum, below 5 ingredients on average per medication, we find inhalation, intravenous, and urethral routes of administration, indicating that those medications which can more freely enter the bloodstream tend to be delivered with as few ingredients as possible beyond the necessary active ingredients.
+* Answering one of the optional questions for this work, I would recommend heavily relying on the field `route` as an important feature for a model predicting the average number of ingredients next year.
+<br/><br/>
+
+## Final Notes
+
+### Actions and Assumptions:
+* For task A, I decided to use the openFDA API in order to target manufacturer-specifc documents. For task B, however, I opted for downloading the entire drug-label dataset, curating and tailoring it for the task's requirements. I could have gone just for the bulk downloading and filtered only the AZ documents for task A, but I decided to treat each task independently (and I wanted to try out the openFDA API anyways :).
+* I could have extracted and streamed the zipped json objects straight into Mongodb, but that would have stored locally an order of magnitude more data than what I chose to work with for this task. Hence, I preferred to stream each part of the dataset into my environment, curate and select only the data I planned to work with, and store only that.
+* Because of the nature of the domain, it might be possible that many compounds contain **one-letter tokens**. My intuition tells me to explore it further and validate if one-letter tokens would improve the quality of parsing and tokenization of medication ingredients. However, because of the task's time constraint, and in order to keep model complexity and estimation time low, I decided to remove one-letter tokens.
+* Because of the nature of the domain many compounds, ingredients, and product/brand names contain **only-number tokens**. Hence I'm not removing only-number tokens in order to improve the quality of parsing and tokenization of medication ingredients.
+* Didn't remove extremely long word-tokens, as I'll usually remove words with more than 20 characters for general domains, words with more than 30 character for certain specialized and/or technical domains, and ad-hoc depending on the language (e.g. you need to give German a lot of space).
+<br/><br/>
+
+### Roads not Taken
+* Pre-processing of MWE: I usually run a battery of pre-processing methods on extracted MWE, such as ratio of hyphens to tokens, of unique tokens to characters, of unique tokens to total tokens, etc. However, due to the time constraints, I've simplified the work.
+* POS tagging of tokens: Adding POS tags and then filtering MWE based on POS patterns produces very good results in constructing semi-supervised language and topic models. Again, POS tagging is a time-consuming process, aswell as the exploration, analysis, and design of domain-specif POS patterns.
+* Weigh MWE based on their lambda/z values: For this work, we are weighing all collocations equally, although this is not true in reality, as the PMI for every ngram is heavily dependant on the domain specificity of the corpus.
+
+### Things to fix:
+* Capturing chemical compounds: I tried learning collocations which captured the structure of chemical compounds containing a hyphenated single-letter token, but was unsuccessful given the time constraints for this work. For example: "n-butyl alcohol", "t-butyl alcohol", "tert-butyl alcohol" tended to loose their single-letter token, and "butyl" and "alcohol" often appeared separated from each other when they collocated.
+* Filter out nested MWE: I did not filtered nested ngrams within a same document, since it requires iterating over every element in every set and identifying if it's a smaller ngram which fits in a larger ngram. This  is a computationally intense process. For e.g.: QTERNMET XR: "saxagliptin_and_metformin_hydrochloride", "saxagliptin_hydrochloride", "saxagliptin", "anhydrous", "metformin_hydrochloride", "metformin", "anhydrous_lactose_magnesium_stearate_microcrystalline_cellulose".
+* Merging of adjacent collocations: Often two adjacent trigrams (or a tigram and a bigram) were joined into a single long multi-word expression, when in fact they're really two independent entities.
+<br/><br/>
