@@ -45,5 +45,4 @@ vignettes/*.pdf
 01_openFDA_API_Exploration/.ipynb_checkpoints
 02_openFDA_Label_Ingredients_Analysis/datasets_json/*.json
 library/
-02_openFDA_Label_Ingredients_Analysis/openFDA_Label_Ingredients_Analysis_files/*
 

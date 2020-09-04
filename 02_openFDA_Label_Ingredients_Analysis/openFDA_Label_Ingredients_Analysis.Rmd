@@ -49,6 +49,8 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 1. [Install MongoDB](https://docs.mongodb.com/manual/installation/) for your operating system, if you haven't already done it. 
+2. Run `renv::restore()` in your R console in order to recreate the virtual environment for running this script.
+3. This work was performed on R version 4.0.2.
 <br/><br/>
 
 #### Import libraries
