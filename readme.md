@@ -27,3 +27,5 @@
 3. Count the unique list of compounded multi-word ingredients plus single-word ingredients per AZ's medicines.
 4. Count the unique list of compounded multi-word ingredients plus single-word ingredients for all manufacturers per year per route of administration.
 
+---
+### [Open the full R Markdown doument in html form](https://leobeeson-github-objects.s3.eu-west-2.amazonaws.com/openFDA_Label_Ingredients_Analysis.html)
